@@ -1,0 +1,81 @@
+name: Visual regression
+
+# Visual tests compare screenshots with approved baseline images. Baselines only make
+# sense in the environment that produced them, so they are created here, in CI:
+#   - first run on main (no baselines yet): creates them and commits them
+#   - every later run: compares against them
+#   - manual run with "update" ticked: re-approves the current look as the new baseline
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      update:
+        description: Approve the current screenshots as the new baselines
+        type: boolean
+        default: false
+
+concurrency:
+  group: visual-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: write
+
+env:
+  CI: 'true'
+
+jobs:
+  visual:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npx playwright install --with-deps chromium
+
+      - name: Decide whether to compare or to create baselines
+        id: mode
+        run: |
+          if [ "${{ inputs.update }}" = "true" ]; then
+            echo "mode=update" >> "$GITHUB_OUTPUT"
+          elif [ -z "$(find adapters -path '*__screenshots__*' -name '*.png' -print -quit)" ]; then
+            echo "mode=create" >> "$GITHUB_OUTPUT"
+          else
+            echo "mode=compare" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Compare with baselines
+        if: steps.mode.outputs.mode == 'compare'
+        run: npx playwright test --grep @visual
+
+      - name: Create or update baselines
+        if: steps.mode.outputs.mode != 'compare'
+        run: npx playwright test --grep @visual --update-snapshots
+
+      - name: Commit baselines
+        if: steps.mode.outputs.mode != 'compare' && github.event_name != 'pull_request'
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add adapters
+          if git diff --cached --quiet; then
+            echo "Baselines unchanged."
+          else
+            git commit -m "Update visual baselines [skip ci]"
+            git push
+          fi
+
+      - name: Upload the differences
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: visual-differences
+          path: test-results
+          retention-days: 7

@@ -1,0 +1,147 @@
+name: Tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+  # Uncomment for a nightly regression run (03:00 UTC, Sunday to Thursday):
+  # schedule:
+  #   - cron: '0 3 * * 0-4'
+
+# A newer push to the same branch cancels the run that is still in progress.
+concurrency:
+  group: tests-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  CI: 'true'
+
+jobs:
+  quality:
+    name: Type-check, lint, core self-tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npm run typecheck
+      - run: npm run lint
+      - run: npx playwright install --with-deps chromium
+      - run: npx playwright test --project=core-selftest
+      - name: Write summary
+        if: always()
+        run: node scripts/summary.mjs "Core self-tests" >> "$GITHUB_STEP_SUMMARY"
+
+  test:
+    name: ${{ matrix.adapter }}
+    needs: quality
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    # One job per application. An outage of one public demo site must not hide the others' results.
+    continue-on-error: ${{ matrix.external-demo }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - adapter: saucedemo
+            browser: true
+            external-demo: false
+          - adapter: restful-booker
+            browser: false
+            external-demo: false
+          - adapter: odoo
+            browser: true
+            # Shared third-party ERP demo: reported, but does not fail the pipeline.
+            external-demo: true
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - name: Install browser
+        if: matrix.browser
+        run: npx playwright install --with-deps chromium
+      - name: Run ${{ matrix.adapter }} tests
+        run: npx playwright test --project="${{ matrix.adapter }}*" --grep-invert @visual
+        # For a real application, pass its settings from repository secrets, for example:
+        # env:
+        #   MYAPP_BASE_URL: ${{ vars.MYAPP_BASE_URL }}
+        #   MYAPP_USERNAME: ${{ secrets.MYAPP_USERNAME }}
+        #   MYAPP_PASSWORD: ${{ secrets.MYAPP_PASSWORD }}
+      - name: Write summary
+        if: always()
+        run: node scripts/summary.mjs "${{ matrix.adapter }}" >> "$GITHUB_STEP_SUMMARY"
+      - name: Upload results for the merged report
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: blob-${{ matrix.adapter }}
+          path: reports/blob
+          retention-days: 3
+      - name: Upload traces, screenshots and videos of failures
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: failures-${{ matrix.adapter }}
+          path: test-results
+          retention-days: 7
+
+  report:
+    name: Merged HTML report
+    needs: test
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: blob-*
+          path: all-blobs
+          merge-multiple: true
+      - run: npx playwright merge-reports --reporter html ./all-blobs
+        env:
+          PLAYWRIGHT_HTML_OUTPUT_DIR: reports/html
+      - uses: actions/upload-artifact@v7
+        with:
+          name: html-report
+          path: reports/html
+          retention-days: 14
+      # Optional: publish the report as a web page.
+      # Turn it on with: Settings > Pages > Source "GitHub Actions", then
+      # Settings > Secrets and variables > Actions > Variables > PUBLISH_REPORT = true
+      - name: Prepare report for GitHub Pages
+        if: vars.PUBLISH_REPORT == 'true' && github.ref == 'refs/heads/main'
+        uses: actions/upload-pages-artifact@v5
+        with:
+          path: reports/html
+
+  publish:
+    name: Publish report to GitHub Pages
+    needs: report
+    if: vars.PUBLISH_REPORT == 'true' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deploy.outputs.page_url }}
+    steps:
+      - id: deploy
+        uses: actions/deploy-pages@v5
